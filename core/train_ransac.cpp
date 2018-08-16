@@ -254,7 +254,7 @@ int main(int argc, const char* argv[])
 
         std::vector<jp::cv_trans_t> hyps;
         std::vector<jp::cv_trans_t> refHyps;
-        std::vector<std::vector<cv::Point2f>> imgPts;
+        std::vector<std::vector<cv::Point3f>> imgdPts;
         std::vector<std::vector<cv::Point3f>> objPts;
         std::vector<std::vector<int>> imgIdx;
         std::vector<cv::Mat_<cv::Vec3f>> patches;
@@ -268,6 +268,11 @@ int main(int argc, const char* argv[])
         double tErr;
         double rotErr;
         int hypIdx;
+
+        jp::img_coord_t camPts;
+        cv::Mat_<cv::Point3f> camPtsMap;
+
+        trainingDataset.getCamPts(imgID, camPts);
 
         processImage(
             imgBGR,
@@ -285,12 +290,14 @@ int main(int argc, const char* argv[])
             correct,
             hyps,
             refHyps,
-            imgPts,
+            imgdPts,
             objPts,
             imgIdx,
             patches,
             sfScores,
             estObj,
+			camPts,
+			camPtsMap,
             sampling,
             sampledPoints,
             losses,
@@ -326,9 +333,11 @@ int main(int argc, const char* argv[])
                     inlierThreshold2D,
                     pixelIdxs[h],
                     estObj,
+					camPts,
+					camPtsMap,
                     sampling,
                     camMat,
-                    imgPts[h],
+                    imgdPts[h],
                     objPts[h],
                     sampledPoints[h],
                     inlierMaps[h]
@@ -368,7 +377,7 @@ int main(int argc, const char* argv[])
         std::cout << BLUETEXT("Calculating gradients wrt scores.") << std::endl;
 
         // calculate derivative of score (sampling prob.) wrt object coordinates, invoces backward pass on score CNN
-        std::vector<cv::Mat_<double>> dLoss_dScore_dObjs = dSMScore(estObj, sampling, sampledPoints, losses, sfScores, stateObj);
+        std::vector<cv::Mat_<double>> dLoss_dScore_dObjs = dSMScore(estObj, camPtsMap, sampling, sampledPoints, losses, sfScores, stateObj);
 
         // accumulate gradients wrt object coordinate via the hypothesis score (sampling probability)
         cv::Mat_<double> dLoss_dScore_dObj = cv::Mat_<double>::zeros(patches.size(), 3);

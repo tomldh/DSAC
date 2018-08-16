@@ -70,6 +70,22 @@ int main(int argc, const char* argv[])
         std::cout << std::endl << REDTEXT("The test set is empty!") << std::endl;
         return 0;
     }
+
+/*
+	// Export registered depth image
+	for (unsigned int idx = 0; idx < testDataset.size(); ++idx)
+	{
+//     std::cout << "Reading File" << trainDataset.depthFiles[idx] << std::endl;
+	   jp::img_bgrd_t imgBGRD;
+	   testDataset.getBGRD(idx, imgBGRD);
+
+	   const std::string dFile = testDataset.depthFiles[idx].substr(testDataset.depthFiles[idx].find_last_of('/')+1);
+//     std::cout << "Processing depth: " << dFile << std::endl;
+
+	   cv::imwrite(dFile, imgBGRD.depth);
+	}
+	exit(0);
+*/
         
     // lua and models
     std::cout << "Loading script: " << baseScriptObj << std::endl;    
@@ -115,7 +131,7 @@ int main(int argc, const char* argv[])
         // process frame (same function used in training, hence most of the variables below are not used here), see method documentation for parameter explanation
         std::vector<jp::cv_trans_t> hyps;
         std::vector<jp::cv_trans_t> refHyps;
-        std::vector<std::vector<cv::Point2f>> imgPts;
+        std::vector<std::vector<cv::Point3f>> imgdPts;
         std::vector<std::vector<cv::Point3f>> objPts;
         std::vector<std::vector<int>> imgIdx;
         std::vector<cv::Mat_<cv::Vec3f>> patches;
@@ -129,6 +145,10 @@ int main(int argc, const char* argv[])
         double tErr;
         double rotErr;
         int hypIdx;
+
+        jp::img_coord_t camPts;
+        cv::Mat_<cv::Point3f> camPtsMap;
+        testDataset.getCamPts(i, camPts);
 
         double expectedLoss;
         double sfEntropy;
@@ -150,12 +170,14 @@ int main(int argc, const char* argv[])
             correct,
             hyps,
             refHyps,
-            imgPts,
+            imgdPts,
             objPts,
             imgIdx,
             patches,
             sfScores,
             estObj,
+			camPts,
+			camPtsMap,
             sampling,
             sampledPoints,
             losses,

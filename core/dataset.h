@@ -254,6 +254,32 @@ namespace jp
             }
         }
 
+    	void getCamPts(size_t i, jp::img_coord_t& img) const
+    	{
+                jp::img_depth_t depthData;
+                getDepth(i, depthData);
+
+                // get ground truth pose
+                jp::info_t poseData;
+                getInfo(i, poseData);
+
+                img = jp::img_coord_t(depthData.rows, depthData.cols);
+
+                #pragma omp parallel for
+                for(unsigned x = 0; x < img.cols; x++)
+                for(unsigned y = 0; y < img.rows; y++)
+                {
+                    if(depthData(y, x) == 0)
+                    {
+                        img(y, x) = jp::coord3_t(0, 0, 0);
+                        continue;
+                    }
+
+                    // transform depth to camera coordinate
+                    img(y, x) = pxToEye(x, y, depthData(y, x));
+                }
+    	}
+
         /**
          * @brief Get the camera coordinate image of the given frame (generated from the depth channel).
          *

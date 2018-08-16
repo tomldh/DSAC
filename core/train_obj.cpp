@@ -233,6 +233,23 @@ int main(int argc, const char* argv[])
         return 0;
     }
 
+/*
+	// Export registered depth image
+	for (unsigned int idx = 0; idx < trainDataset.size(); ++idx)
+	{
+
+		//std::cout << "Reading File" << trainDataset.depthFiles[idx] << std::endl;
+		jp::img_bgrd_t imgBGRD;
+		trainDataset.getBGRD(idx, imgBGRD);
+
+		const std::string dFile = trainDataset.depthFiles[idx].substr(trainDataset.depthFiles[idx].find_last_of('/')+1);
+		//std::cout << "Processing depth: " << dFile << std::endl;
+
+		cv::imwrite(dFile, imgBGRD.depth);
+	}
+	exit(0);
+*/
+
     #if DOVALIDATION
     std::string validationDir = dataDir + "validation/";
 

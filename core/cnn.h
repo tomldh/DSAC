@@ -208,6 +208,365 @@ cv::Mat_<double> dPNP(
     return jacobean;
 }
 
+/*
+ * @brief reimplementation of PyTorch svd_backward in C++
+ *
+ * ref: https://github.com/pytorch/pytorch/blob/1d427fd6f66b0822db62f30e7654cae95abfd207/tools/autograd/templates/Functions.cpp
+ * ref: https://j-towns.github.io/papers/svd-derivative.pdf
+ *
+ * This makes no assumption on the signs of sigma.
+ *
+ * @param grad: gradients w.r.t U, W, V
+ * @param self: matrix decomposed by SVD
+ * @param raw_u: U from SVD output
+ * @param sigma: W from SVD output
+ * @param raw_v: V from SVD output
+ *
+ */
+cv::Mat svd_backward(const std::vector<cv::Mat> &grads, const cv::Mat& self, const cv::Mat& raw_u, const cv::Mat& sigma, const cv::Mat& raw_v)
+{
+	auto m = self.rows;
+	auto n = self.cols;
+	auto k = sigma.cols;
+	auto gsigma = grads[1];
+
+	auto u = raw_u;
+	auto v = raw_v;
+	auto gu = grads[0];
+	auto gv = grads[2];
+
+	auto vt = v.t();
+
+	cv::Mat sigma_term;
+
+	if (!gsigma.empty())
+	{
+		sigma_term = (u * cv::Mat::diag(gsigma)) * vt;
+	}
+	else
+	{
+		sigma_term = cv::Mat::zeros(self.size(), self.type());
+	}
+	// in case that there are no gu and gv, we can avoid the series of kernel
+	// calls below
+	if (gv.empty() && gu.empty())
+	{
+		return sigma_term;
+	}
+
+	auto ut = u.t();
+	auto im = cv::Mat::eye((int)m, (int)m, self.type());
+	auto in = cv::Mat::eye((int)n, (int)n, self.type());
+	auto sigma_mat = cv::Mat::diag(sigma);
+
+	cv::Mat sigma_mat_inv;
+	cv::pow(sigma, -1, sigma_mat_inv);
+	sigma_mat_inv = cv::Mat::diag(sigma_mat_inv);
+
+	cv::Mat sigma_sq, sigma_expanded_sq;
+	cv::pow(sigma, 2, sigma_sq);
+	sigma_expanded_sq = cv::repeat(sigma_sq, sigma_mat.rows, 1);
+
+	cv::Mat F = sigma_expanded_sq - sigma_expanded_sq.t();
+	// The following two lines invert values of F, and fills the diagonal with 0s.
+	// Notice that F currently has 0s on diagonal. So we fill diagonal with +inf
+	// first to prevent nan from appearing in backward of this function.
+	F.diag().setTo(std::numeric_limits<float>::max());
+	cv::pow(F, -1, F);
+
+	cv::Mat u_term, v_term;
+
+	if (!gu.empty())
+	{
+		cv::multiply(F, ut*gu-gu.t()*u, u_term);
+		u_term = (u * u_term) * sigma_mat;
+		if (m > k)
+		{
+			u_term = u_term + ((im - u*ut)*gu)*sigma_mat_inv;
+		}
+		u_term = u_term * vt;
+	}
+	else
+	{
+		u_term = cv::Mat::zeros(self.size(), self.type());
+	}
+
+	if (!gv.empty())
+	{
+		auto gvt = gv.t();
+		cv::multiply(F, vt*gv - gvt*v, v_term);
+		v_term = (sigma_mat*v_term) * vt;
+		if (n > k)
+		{
+			v_term = v_term + sigma_mat_inv*(gvt*(in - v*vt));
+		}
+		v_term = u * v_term;
+	}
+	else
+	{
+		v_term = cv::Mat::zeros(self.size(), self.type());
+	}
+
+	return u_term + sigma_term + v_term;
+}
+
+/*
+ * @brief Compute partial derivatives of the matrix product for each multiplied matrix.
+ * 			This wrapper function avoids unnecessary computation
+ *
+ * @param _Amat: First multiplied matrix.
+ * @param _Bmat: Second multiplied matrix.
+ * @param _dABdA Output parameter: First output derivative matrix. Pass cv::noArray() if not needed.
+ * @param _dABdB Output parameter: Second output derivative matrix. Pass cv::noArray() if not needed.
+ *
+ */
+void matMulDerivWrapper(cv::InputArray _Amat, cv::InputArray _Bmat, cv::OutputArray _dABdA, cv::OutputArray _dABdB)
+{
+	cv::Mat A = _Amat.getMat(), B = _Bmat.getMat();
+
+
+	if (_dABdA.needed())
+	{
+		_dABdA.create(A.rows*B.cols, A.rows*A.cols, A.type());
+	}
+
+	if (_dABdB.needed())
+	{
+		_dABdB.create(A.rows*B.cols, B.rows*B.cols, A.type());
+	}
+
+	CvMat matA = A, matB = B, c_dABdA=_dABdA.getMat(), c_dABdB=_dABdB.getMat();
+
+	cvCalcMatMulDeriv(&matA, &matB, _dABdA.needed() ? &c_dABdA : 0, _dABdB.needed() ? &c_dABdB : 0);
+
+}
+
+/*
+ * @brief Computes extrinsic camera parameters using Kabsch algorithm.
+ * 			If jacobean matrix is passed as arugument, it further computes the analytical gradients.
+ *
+ * @param imgdPts: measurements
+ * @param objPts: scene points
+ * @param extCam Output parameter: extrinsic camera matrix (i.e. rotation vector and translation vector)
+ * @param _jacobean Output parameter: 6x3N jacobean matrix of rotation and translation vector
+ * 					w.r.t scene point coordinates.
+ * 					If gradient computation is not successful, jacobean matrix is set empty.
+ *
+ */
+void kabsch(const std::vector<cv::Point3f>& imgdPts, const std::vector<cv::Point3f>& objPts, jp::cv_trans_t& extCam, cv::OutputArray _jacobean=cv::noArray())
+{
+
+	unsigned int N = objPts.size();  //number of scene points
+	bool calc = _jacobean.needed();  //check if computation of gradient is required
+	bool degenerate = false;  //indicate if SVD gives degenerate case, i.e. non-distinct or zero singular values
+
+	cv::Mat P, X, Pc, Xc;  //Nx3
+	cv::Mat A, U, W, Vt, V, D, R;  //3x3
+	cv::Mat cx, cp, r, t;  //1x3
+	cv::Mat invN;  //1xN
+	cv::Mat gRodr;  //9x3
+
+	// construct the datasets P and X from input vectors, set false to avoid data copying
+	P = cv::Mat(imgdPts, false).reshape(1, N);
+	X = cv::Mat(objPts, false).reshape(1, N);
+
+	// compute centroid as average of each coordinate axis
+	invN = cv::Mat(1, N, CV_32F, 1.f/N);  //average filter
+	cx = invN * X;
+	cp = invN * P;
+
+	// move centroid of datasets to origin
+	Xc =  X - cv::repeat(cx, N, 1);
+	Pc =  P - cv::repeat(cp, N, 1);
+
+	// compute covariance matrix
+	A = Pc.t() * Xc;
+
+	// compute SVD of covariance matrix
+	cv::SVD::compute(A, W, U, Vt);
+
+	// degenerate if any singular value is zero
+	if ((unsigned int)cv::countNonZero(W) != (unsigned int)W.total())
+		degenerate = true;
+
+	// degenerate if singular values are not distinct
+	if (std::abs(W.at<float>(0,0)-W.at<float>(1,0)) < 1e-6
+			|| std::abs(W.at<float>(0,0)-W.at<float>(2,0)) < 1e-6
+			|| std::abs(W.at<float>(1,0)-W.at<float>(2,0)) < 1e-6)
+		degenerate = true;
+
+	// for correcting rotation matrix to ensure a right-handed coordinate system
+	float d = cv::determinant(U * Vt);
+
+	D = (cv::Mat_<float>(3,3) <<
+				1., 0., 0.,
+				0., 1., 0.,
+				0., 0., d );
+
+	// calculates rotation matrix R
+	R = U * (D * Vt);
+
+	// convert rotation matrix to rotation vector,
+	// if needed, also compute jacobean matrix of rotation matrix w.r.t rotation vector
+	calc ? cv::Rodrigues(R, r, gRodr) : cv::Rodrigues(R, r);
+
+	// calculates translation vector
+	t = cp - cx * R.t();  //equiv: cp - (R*cx.t()).t();
+
+	// store results
+	extCam.first = r.reshape(1, 3);
+	extCam.second = t.reshape(1, 3);
+
+	// end here no gradient is required
+	if (!calc)
+		return;
+
+	// if SVD is degenerate, return empty jacobean matrix
+	if (degenerate)
+	{
+		_jacobean.release();
+		return;
+	}
+
+	// allocate matrix data
+	_jacobean.create(6, N*3, CV_64F);
+	cv::Mat jacobean = _jacobean.getMat();
+
+//	cv::Mat dRidU, dRidVt, dRidV, dRidA, dRidXc, dRidX;
+	cv::Mat dRdU, dRdVt;  //9x9
+	cv::Mat dAdXc;  //9x3N
+	cv::Mat dtdR;  //3x9
+	cv::Mat dtdcx;  //3x3
+	cv::Mat dcxdX, drdX, dtdX;  //3x3N
+	cv::Mat dRdX = cv::Mat_<float>::zeros(9, N*3);  //9x3N
+
+	// jacobean matrices of each dot product operation in kabsch algorithm
+	matMulDerivWrapper(U, Vt, dRdU, dRdVt);
+	matMulDerivWrapper(Pc.t(), Xc, cv::noArray(), dAdXc);
+	matMulDerivWrapper(R, cx.t(), dtdR, dtdcx);
+	matMulDerivWrapper(invN, X, cv::noArray(), dcxdX);
+
+	V = Vt.t();
+	W = W.reshape(1, 1);
+
+//	#pragma omp parallel for
+	for (int i = 0; i < 9; ++i)
+	{
+		cv::Mat dRidU, dRidVt, dRidV, dRidA;  //3x3
+		cv::Mat dRidXc, dRidX;  //Nx3
+
+		dRidU = dRdU.row(i).reshape(1, 3);
+		dRidVt = dRdVt.row(i).reshape(1, 3);
+
+		dRidV = dRidVt.t();
+
+		//W is not used in computation of R, no gradient of W is needed
+		std::vector<cv::Mat> grads{dRidU, cv::Mat(), dRidV};
+
+		dRidA = svd_backward(grads, A, U, W, V);
+
+		dRidA = dRidA.reshape(1, 1);
+
+		dRidXc = dRidA * dAdXc;
+
+		dRidXc = dRidXc.reshape(1, N);
+
+		dRidX = cv::Mat::zeros(dRidXc.size(), dRidXc.type());
+
+		int bstep = dRidXc.step/CV_ELEM_SIZE(dRidXc.type());
+
+//		#pragma omp parallel for
+		for (int j = 0; j < 3; ++j)
+		{
+			// compute dRidXj = dRidXcj * dXcjdXj
+			float* pdRidXj = (float*)dRidX.data + j;
+			const float* pdRidXcj = (const float*)dRidXc.data + j;
+
+			float tmp = 0.f;
+			for (unsigned int k = 0; k < N; ++k)
+			{
+				tmp += pdRidXcj[k*bstep];
+			}
+			tmp /= N;
+
+			for (unsigned int k = 0; k < N; ++k)
+			{
+				pdRidXj[k*bstep] = pdRidXcj[k*bstep] - tmp;
+			}
+		}
+
+		dRidX = dRidX.reshape(1, 1);
+
+		dRidX.copyTo(dRdX.rowRange(i, i+1));
+	}
+
+	drdX = gRodr.t() * dRdX;
+
+	drdX.copyTo(jacobean.rowRange(0, 3));
+
+	dtdX = - (dtdR * dRdX + dtdcx * dcxdX);
+
+	dtdX.copyTo(jacobean.rowRange(3, 6));
+
+}
+
+/*
+ * @brief Computes gradient of Kabsch algorithm and differentiation
+ * 			using central finite differences
+ *
+ * @param imgdPts: measurement points
+ * @param objPts: scene points
+ * @param jacobean Output parameter: 6x3N jacobean matrix of rotation and translation vector
+ * 										w.r.t scene point coordinates
+ * @param eps: step size in finite difference approximation
+ *
+ */
+void dKabschFD(std::vector<cv::Point3f>& imgdPts, std::vector<cv::Point3f> objPts, cv::OutputArray _jacobean, float eps = 0.001f)
+{
+	_jacobean.create(6, objPts.size()*3, CV_64F);
+	cv::Mat jacobean = _jacobean.getMat();
+
+	for (unsigned int i = 0; i < objPts.size(); ++i)
+	{
+		for (unsigned int j = 0; j < 3; ++j)
+		{
+
+			if(j == 0) objPts[i].x += eps;
+			else if(j == 1) objPts[i].y += eps;
+			else if(j == 2) objPts[i].z += eps;
+
+			// forward step
+
+			jp::cv_trans_t fStep;
+			kabsch(imgdPts, objPts, fStep);
+
+			if(j == 0) objPts[i].x -= 2 * eps;
+			else if(j == 1) objPts[i].y -= 2 * eps;
+			else if(j == 2) objPts[i].z -= 2 * eps;
+
+			// backward step
+			jp::cv_trans_t bStep;
+			kabsch(imgdPts, objPts, bStep);
+
+			if(j == 0) objPts[i].x += eps;
+			else if(j == 1) objPts[i].y += eps;
+			else if(j == 2) objPts[i].z += eps;
+
+			// gradient calculation
+			fStep.first = (fStep.first - bStep.first) / (2 * eps);
+			fStep.second = (fStep.second - bStep.second) / (2 * eps);
+
+			fStep.first.copyTo(jacobean.col(i * 3 + j).rowRange(0, 3));
+			fStep.second.copyTo(jacobean.col(i * 3 + j).rowRange(3, 6));
+
+			if(containsNaNs(jacobean.col(i * 3 + j)))
+				jacobean.setTo(0);
+
+		}
+	}
+
+}
+
 /**
  * @brief Calculate the average of all matrix entries.
  * @param mat Input matrix.
@@ -333,6 +692,28 @@ jp::img_coord_t getCoordImg(
     std::cout << "CNN prediction took " << stopW.stop() / 1000 << "s." << std::endl;
     
     return modeImg;
+}
+
+/**
+ * @brief Transforms a coordinate image to a floating point CNN output format.
+ *
+ * The image will be subsampled according to the CNN output dimensions.
+ *
+ * @param obj Coordinate image.
+ * @param sampling Subsampling information of CNN output wrt to RGB input.
+ * @return Coordinate image in CNN output format.
+ */
+cv::Mat_<cv::Point3f> getCamPtsMap(const jp::img_coord_t& camPts, const cv::Mat_<cv::Point2i>& sampling)
+{
+    cv::Mat_<cv::Point3f> camPtsMap(sampling.size());
+
+    for(unsigned x = 0; x < sampling.cols; x++)
+    for(unsigned y = 0; y < sampling.rows; y++)
+    {
+        camPtsMap(y, x) = cv::Point3f(camPts(sampling(y, x).y, sampling(y, x).x));
+    }
+
+    return camPtsMap;
 }
 
 /**
@@ -627,23 +1008,24 @@ std::vector<double> softMax(const std::vector<double>& scores)
  * @param scoreOutputGradients Gradients w.r.t the score i.e. the gradients of the output of the score CNN.
  */
 void dScore(
-    jp::img_coord_t estObj, 
+    jp::img_coord_t estObj,
     const cv::Mat_<cv::Point2i>& sampling,
+	const cv::Mat_<cv::Point3f>& labelCC,
     const std::vector<std::vector<cv::Point2i>>& points,
     lua_State* stateObj,
     std::vector<cv::Mat_<double>>& jacobeans,
     const std::vector<double>& scoreOutputGradients)
-{  
+{
     GlobalProperties* gp = GlobalProperties::getInstance();
-    cv::Mat_<float> camMat = gp->getCamMat();  
-  
+    cv::Mat_<float> camMat = gp->getCamMat();
+
     int hypCount = points.size();
-    
-    std::vector<std::vector<cv::Point2f>> imgPts(hypCount);
+
+    std::vector<std::vector<cv::Point3f>> imgdPts(hypCount);
     std::vector<std::vector<cv::Point3f>> objPts(hypCount);
     std::vector<jp::jp_trans_t> hyps(hypCount);
     std::vector<cv::Mat_<float>> diffMaps(hypCount);
-    
+
     // calculate Hypotheses and reprojection error images from object coordinate estiamtions
     #pragma omp parallel for
     for(unsigned h = 0; h < hypCount; h++)
@@ -653,23 +1035,24 @@ void dScore(
             int x = points[h][i].x;
             int y = points[h][i].y;
 
-            imgPts[h].push_back(sampling(y, x));
+            imgdPts[h].push_back(labelCC(y, x));
             objPts[h].push_back(cv::Point3f(estObj(y, x)));
         }
 
         // calculate hypothesis
         jp::cv_trans_t cvHyp;
-        safeSolvePnP(objPts[h], imgPts[h], camMat, cv::Mat(), cvHyp.first, cvHyp.second, false, CV_P3P);
+        kabsch(imgdPts[h], objPts[h], cvHyp);
+
         hyps[h] = jp::cv2our(cvHyp);
 
         // calculate projection errors
         diffMaps[h] = getDiffMap(cvHyp, estObj, sampling, camMat);
     }
-    
+
     // backward pass of the score cnn, returns gradients w.r.t. to image of reprojection errors
     std::vector<cv::Mat_<double>> dDiffMaps;
     backward(diffMaps, stateObj, scoreOutputGradients, dDiffMaps);
-    
+
     // one Jacobean per hypothesis
     jacobeans.resize(hypCount);
     #pragma omp parallel for
@@ -679,7 +1062,10 @@ void dScore(
 
         // accumulate derivate of score wrt the object coordinates that are used to calculate the pose
         cv::Mat_<double> supportPointGradients = cv::Mat_<double>::zeros(1, 12);
-        cv::Mat_<double> dHdO = dPNP(imgPts[h], objPts[h]); // 6x12
+
+        cv::Mat_<double> dHdO;
+        jp::cv_trans_t cvHyp;
+        kabsch(imgdPts[h], objPts[h], cvHyp, dHdO); // 6x12
 
         for(unsigned x = 0; x < dDiffMaps[h].cols; x++)
         for(unsigned y = 0; y < dDiffMaps[h].rows; y++)
@@ -724,8 +1110,9 @@ void dScore(
  * @return List of Jacobean matrices. One 1 x 3n matrix per pose hypothesis.
  */
 std::vector<cv::Mat_<double>> dSMScore(
-    jp::img_coord_t estObj, 
+    jp::img_coord_t estObj,
     const cv::Mat_<cv::Point2i>& sampling,
+	const cv::Mat_<cv::Point3f>& labelCC,
     const std::vector<std::vector<cv::Point2i>>& points,
     const std::vector<double>& losses,
     const std::vector<double>& sfScores,
@@ -733,18 +1120,18 @@ std::vector<cv::Mat_<double>> dSMScore(
 {
     // assemble the gradients wrt the scores, ie the gradients of soft max function
     std::vector<double> scoreOutputGradients(points.size());
-        
+
     for(unsigned i = 0; i < points.size(); i++)
     {
         scoreOutputGradients[i] = sfScores[i] * losses[i];
         for(unsigned j = 0; j < points.size(); j++)
             scoreOutputGradients[i] -= sfScores[i] * sfScores[j] * losses[j];
     }
- 
+
     // calculate gradients of the score function
     std::vector<cv::Mat_<double>> jacobeans;
-    dScore(estObj, sampling, points, stateObj, jacobeans, scoreOutputGradients);
- 
+    dScore(estObj, sampling, labelCC, points, stateObj, jacobeans, scoreOutputGradients);
+
     // data conversion
     for(unsigned i = 0; i < jacobeans.size(); i++)
     {
@@ -763,7 +1150,7 @@ std::vector<cv::Mat_<double>> dSMScore(
 
         jacobeans[i] = reformat;
     }
-    
+
     return jacobeans;
 }
 
@@ -789,20 +1176,23 @@ std::vector<double> refine(
     float inlierThreshold2D,
     const std::vector<std::vector<int>>& pixelIdxs,
     const jp::img_coord_t& estObj,
+	const jp::img_coord_t& camPts,
+	const cv::Mat_<cv::Point3f>& camPtsMap,
     const cv::Mat_<cv::Point2i>& sampling,
     const cv::Mat& camMat,
-    const std::vector<cv::Point2f>& imgPts,
+    const std::vector<cv::Point3f>& imgdPts,
     const std::vector<cv::Point3f>& objPts)
 {
     // reconstruct the input pose given the 2D-3D correspondences
     jp::cv_trans_t hyp;
-    safeSolvePnP(objPts, imgPts, camMat, cv::Mat(), hyp.first, hyp.second, false, CV_P3P);
+    kabsch(imgdPts, objPts, hyp);
+
     cv::Mat_<float> diffMap = getDiffMap(hyp, estObj, sampling, camMat);
   
     for(unsigned rStep = 0; rStep < refSteps; rStep++) // refinement iterations
     {
         // collect 2D-3D correspondences
-        std::vector<cv::Point2f> localImgPts;
+        std::vector<cv::Point3f> localImgdPts;
         std::vector<cv::Point3f> localObjPts;
 
         for(unsigned idx = 0; idx < pixelIdxs[rStep].size(); idx++)
@@ -813,15 +1203,15 @@ std::vector<double> refine(
             // inlier check
             if(diffMap(y, x) < inlierThreshold2D)
             {
-                localImgPts.push_back(sampling(y, x));
+                localImgdPts.push_back(camPtsMap(y, x));
                 localObjPts.push_back(cv::Point3f(estObj(y, x)));
             }
 
-            if(localImgPts.size() >= inlierCount)
+            if(localImgdPts.size() >= inlierCount)
             break;
         }
 
-        if(localImgPts.size() < 50) // abort for stability: to few inliers
+        if(localImgdPts.size() < 50) // abort for stability: to few inliers
             break;
 
         // recalculate pose
@@ -829,8 +1219,7 @@ std::vector<double> refine(
         hypUpdate.first = hyp.first.clone();
         hypUpdate.second = hyp.second.clone();
 
-        if(!safeSolvePnP(localObjPts, localImgPts, camMat, cv::Mat(), hypUpdate.first, hypUpdate.second, true, (localImgPts.size() > 4) ? CV_ITERATIVE : CV_P3P))
-            break; //abort if PnP fails
+        kabsch(localImgdPts, localObjPts, hypUpdate);
 
         if(containsNaNs(hypUpdate.first) || containsNaNs(hypUpdate.second))
             break; // abort if PnP fails
@@ -870,15 +1259,19 @@ cv::Mat_<double> dRefine(
     float inlierThreshold2D,
     const std::vector<std::vector<int>>& pixelIdxs,
     const jp::img_coord_t& estObj,
+	const jp::img_coord_t& camPts,
+	const cv::Mat_<cv::Point3f>& camPtsMap,
     const cv::Mat_<cv::Point2i>& sampling,
     const cv::Mat& camMat,
-    const std::vector<cv::Point2f>& imgPts,
+    const std::vector<cv::Point3f>& imgdPts,
     std::vector<cv::Point3f> objPts,
     const std::vector<cv::Point2i>& sampledPoints,
     const cv::Mat_<int>& inlierMap,
     float eps = 2.f)
 {
     jp::img_coord_t localEstObj = estObj.clone();
+    jp::img_coord_t localCamPts = camPts.clone();
+
     cv::Mat_<double> jacobean = cv::Mat_<double>::zeros(6, localEstObj.cols * localEstObj.rows * 3);
     
     // calculate gradient wrt the initial 4 points (minimal set that define the pose)
@@ -897,9 +1290,11 @@ cv::Mat_<double> dRefine(
             inlierThreshold2D,
             pixelIdxs,
             localEstObj,
+			localCamPts,
+			camPtsMap,
             sampling,
             camMat,
-            imgPts,
+            imgdPts,
             objPts
         );
 
@@ -915,9 +1310,11 @@ cv::Mat_<double> dRefine(
             inlierThreshold2D,
             pixelIdxs,
             localEstObj,
+			localCamPts,
+			camPtsMap,
             sampling,
             camMat,
-            imgPts,
+            imgdPts,
             objPts
         );
 
@@ -957,9 +1354,11 @@ cv::Mat_<double> dRefine(
                 inlierThreshold2D,
                 pixelIdxs,
                 localEstObj,
+				localCamPts,
+				camPtsMap,
                 sampling,
                 camMat,
-                imgPts,
+                imgdPts,
                 objPts
             );
 
@@ -972,9 +1371,11 @@ cv::Mat_<double> dRefine(
                 inlierThreshold2D,
                 pixelIdxs,
                 localEstObj,
+				localCamPts,
+				camPtsMap,
                 sampling,
                 camMat,
-                imgPts,
+                imgdPts,
                 objPts
             );
 
@@ -1041,12 +1442,14 @@ void processImage(
     bool& correct,
     std::vector<jp::cv_trans_t>& hyps,
     std::vector<jp::cv_trans_t>& refHyps,
-    std::vector<std::vector<cv::Point2f>>& imgPts,
+    std::vector<std::vector<cv::Point3f>>& imgdPts,
     std::vector<std::vector<cv::Point3f>>& objPts,
     std::vector<std::vector<int>>& imgIdx,
     std::vector<cv::Mat_<cv::Vec3f>>& patches,
     std::vector<double>& sfScores,
     jp::img_coord_t& estObj,
+	jp::img_coord_t& camPts,
+	cv::Mat_<cv::Point3f>& camPtsMap,
     cv::Mat_<cv::Point2i>& sampling,
     std::vector<std::vector<cv::Point2i>>& sampledPoints,
     std::vector<double>& losses,
@@ -1057,32 +1460,34 @@ void processImage(
     int& hypIdx)
 {
     std::cout << BLUETEXT("Predicting object coordinates.") << std::endl;
-    StopWatch stopW;  
-    
+    StopWatch stopW;
+
     // generate subsampling of input image for speed
     sampling = stochasticSubSample(imgBGR, CNN_OBJ_PATCHSIZE, CNN_RGB_PATCHSIZE);
     patches.clear();
     // get object coordinate predictions for subsampled image locations
     estObj = getCoordImg(imgBGR, sampling, CNN_RGB_PATCHSIZE, patches, stateRGB);
 
+	camPtsMap = getCamPtsMap(camPts, sampling);
+
     std::cout << BLUETEXT("Sampling " << objHyps << " hypotheses.") << std::endl;
 
     hyps.resize(objHyps);
-    imgPts.resize(objHyps);
+    imgdPts.resize(objHyps);
     objPts.resize(objHyps);
     sampledPoints.resize(objHyps);
-    
+
     // keep track of the points each hypothesis is samples from
     // the index references the patch list above
-    imgIdx.resize(objHyps); 
-  
+    imgIdx.resize(objHyps);
+
     #pragma omp parallel for
     for(unsigned h = 0; h < hyps.size(); h++)
     while(true)
     {
         std::vector<cv::Point2f> projections;
         cv::Mat_<uchar> alreadyChosen = cv::Mat_<uchar>::zeros(estObj.size()); // no points should appear more than once in a minimal set
-        imgPts[h].clear();
+        imgdPts[h].clear();
         objPts[h].clear();
         imgIdx[h].clear();
         sampledPoints[h].clear();
@@ -1101,24 +1506,23 @@ void processImage(
 
             alreadyChosen(y, x) = 1;
 
-            imgPts[h].push_back(sampling(y, x)); // 2D location in the original RGB image
+            imgdPts[h].push_back(camPtsMap(y, x)); // 2D location in the original RGB image
             objPts[h].push_back(cv::Point3f(estObj(y, x))); // 3D object coordinate
             imgIdx[h].push_back(y * CNN_OBJ_PATCHSIZE + x); // pixel index in the subsampled image (for easier access in some data containers)
             sampledPoints[h].push_back(cv::Point2i(x, y)); // 2D pixel location in the subsampled image
         }
 
-        // solve PNP
-        if(!safeSolvePnP(objPts[h], imgPts[h], camMat, cv::Mat(), hyps[h].first, hyps[h].second, false, CV_P3P))
-            continue; // abort if PNP failes
+        // solve Kabsch
+        kabsch(imgdPts[h], objPts[h], refHyps[h]);
 
         // project 3D points back into the image
         cv::projectPoints(objPts[h], hyps[h].first, hyps[h].second, camMat, cv::Mat(), projections);
 
         // check reconstruction, 4 sampled points should be reconstructed perfectly
         bool foundOutlier = false;
-        for(unsigned j = 0; j < imgPts[h].size(); j++)
+        for(unsigned j = 0; j < imgdPts[h].size(); j++)
         {
-            if(cv::norm(imgPts[h][j] - projections[j]) < inlierThreshold2D) continue;
+            if(cv::norm(cv::Point2f(imgdPts[h][j].x, imgdPts[h][j].y) - projections[j]) < inlierThreshold2D) continue;
             foundOutlier = true;
             break;
         }
@@ -1126,48 +1530,48 @@ void processImage(
             continue;
         else
             break;
-    }	
+    }
 
-    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;	
+    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;
     std::cout << BLUETEXT("Calculating scores.") << std::endl;
 
     // compute reprojection error images
     std::vector<cv::Mat_<float>> diffMaps(objHyps);
-    #pragma omp parallel for 
+    #pragma omp parallel for
     for(unsigned h = 0; h < hyps.size(); h++)
         diffMaps[h] = getDiffMap(hyps[h], estObj, sampling, camMat);
 
     // execute score CNN to get hypothesis scores
     std::vector<double> scores = forward(diffMaps, stateObj);
-    
-    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;	
-    std::cout << BLUETEXT("Drawing final Hypothesis.") << std::endl;	
-    
+
+    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;
+    std::cout << BLUETEXT("Drawing final Hypothesis.") << std::endl;
+
     // apply soft max to scores to get a distribution
     sfScores = softMax(scores);
     sfEntropy = entropy(sfScores); // measure distribution entropy
     hypIdx = draw(sfScores); // select winning hypothesis
-    
-    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;	
+
+    std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;
     std::cout << BLUETEXT("Refining poses:") << std::endl;
 
     // we refine all hypothesis because we are interested in the expectation of loss
     refHyps.resize(hyps.size());
-    
-    #pragma omp parallel for 
+
+    #pragma omp parallel for
     for(unsigned h = 0; h < hyps.size(); h++)
     {
         refHyps[h].first = hyps[h].first.clone();
         refHyps[h].second = hyps[h].second.clone();
     }
-    
+
     // collect inliers for all hypotheses
     inlierMaps.resize(hyps.size());
     pixelIdxs.resize(hyps.size());
-    
-    #pragma omp parallel for 
+
+    #pragma omp parallel for
     for(unsigned h = 0; h < hyps.size(); h++)
-    {         
+    {
         std::mt19937 randG;
         cv::Mat_<float> localDiffMap = diffMaps[h];
         inlierMaps[h] = cv::Mat_<int>::zeros(diffMaps[h].size());
@@ -1180,7 +1584,7 @@ void processImage(
                 pixelIdxs[h][rStep].push_back(idx);
             std::shuffle(pixelIdxs[h][rStep].begin(), pixelIdxs[h][rStep].end(), randG);
 
-            std::vector<cv::Point2f> localImgPts;
+            std::vector<cv::Point3f> localImgdPts;
             std::vector<cv::Point3f> localObjPts;
 
             for(unsigned idx = 0; idx < pixelIdxs[h][rStep].size(); idx++)
@@ -1191,16 +1595,16 @@ void processImage(
                 // inlier check
                 if(localDiffMap(y, x) < inlierThreshold2D)
                 {
-                    localImgPts.push_back(sampling(y, x));
+                    localImgdPts.push_back(camPtsMap(y, x));
                     localObjPts.push_back(cv::Point3f(estObj(y, x)));
                     inlierMaps[h](y, x) = inlierMaps[h](y, x) + 1;
                  }
 
-                if(localImgPts.size() >= inlierCount)
+                if(localImgdPts.size() >= inlierCount)
                     break; // max number of inlier reached
             }
 
-            if(localImgPts.size() < 50)
+            if(localImgdPts.size() < 50)
                 break; // abort for stability: too few inliers
 
             // recalculate pose
@@ -1208,8 +1612,7 @@ void processImage(
             hypUpdate.first = refHyps[h].first.clone();
             hypUpdate.second = refHyps[h].second.clone();
 
-            if(!safeSolvePnP(localObjPts, localImgPts, camMat, cv::Mat(), hypUpdate.first, hypUpdate.second, true, (localImgPts.size() > 4) ? CV_ITERATIVE : CV_P3P))
-                break; //abort if PnP fails
+            kabsch(localImgdPts, localObjPts, hypUpdate);
 
             if(containsNaNs(hypUpdate.first) || containsNaNs(hypUpdate.second))
                 break; // abort if PnP fails
@@ -1228,17 +1631,17 @@ void processImage(
             inlierMaps[h](y, x) = 0;
         }
     }
-       
+
     std::cout << "Done in " << stopW.stop() / 1000 << "s." << std::endl;
     std::cout << BLUETEXT("Final Result:") << std::endl;
-    
+
     // evaluate result
     jp::jp_trans_t jpHyp = jp::cv2our(refHyps[hypIdx]);
-    Hypothesis poseEst(jpHyp.first, jpHyp.second);	
-    
+    Hypothesis poseEst(jpHyp.first, jpHyp.second);
+
     expectedLoss = expectedMaxLoss(poseGT, refHyps, sfScores, losses);
     std::cout << "Loss of winning hyp: " << maxLoss(poseGT, poseEst) << ", prob: " << sfScores[hypIdx] << ", expected loss: " << expectedLoss << std::endl;
-    
+
     // measure pose error in the inverted system (scene pose vs camera pose)
     Hypothesis invPoseGT = getInvHyp(poseGT);
     Hypothesis invPoseEst = getInvHyp(poseEst);
