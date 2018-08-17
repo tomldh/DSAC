@@ -147,7 +147,7 @@ int main(int argc, const char* argv[])
         int hypIdx;
 
         jp::img_coord_t camPts;
-        cv::Mat_<cv::Point3f> camPtsMap;
+        jp::img_coord_t camPtsMap;
         testDataset.getCamPts(i, camPts);
 
         double expectedLoss;

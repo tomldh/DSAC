@@ -703,14 +703,14 @@ jp::img_coord_t getCoordImg(
  * @param sampling Subsampling information of CNN output wrt to RGB input.
  * @return Coordinate image in CNN output format.
  */
-cv::Mat_<cv::Point3f> getCamPtsMap(const jp::img_coord_t& camPts, const cv::Mat_<cv::Point2i>& sampling)
+jp::img_coord_t getCamPtsMap(const jp::img_coord_t& camPts, const cv::Mat_<cv::Point2i>& sampling)
 {
-    cv::Mat_<cv::Point3f> camPtsMap(sampling.size());
+	jp::img_coord_t camPtsMap = jp::img_coord_t::zeros(sampling.size());
 
     for(unsigned x = 0; x < sampling.cols; x++)
     for(unsigned y = 0; y < sampling.rows; y++)
     {
-        camPtsMap(y, x) = cv::Point3f(camPts(sampling(y, x).y, sampling(y, x).x));
+        camPtsMap(y, x) = camPts(sampling(y, x).y, sampling(y, x).x);
     }
 
     return camPtsMap;
@@ -1010,7 +1010,7 @@ std::vector<double> softMax(const std::vector<double>& scores)
 void dScore(
     jp::img_coord_t estObj,
     const cv::Mat_<cv::Point2i>& sampling,
-	const cv::Mat_<cv::Point3f>& labelCC,
+	const jp::img_coord_t& camPtsMap,
     const std::vector<std::vector<cv::Point2i>>& points,
     lua_State* stateObj,
     std::vector<cv::Mat_<double>>& jacobeans,
@@ -1035,7 +1035,7 @@ void dScore(
             int x = points[h][i].x;
             int y = points[h][i].y;
 
-            imgdPts[h].push_back(labelCC(y, x));
+            imgdPts[h].push_back(cv::Point3f(camPtsMap(y, x)));
             objPts[h].push_back(cv::Point3f(estObj(y, x)));
         }
 
@@ -1112,7 +1112,7 @@ void dScore(
 std::vector<cv::Mat_<double>> dSMScore(
     jp::img_coord_t estObj,
     const cv::Mat_<cv::Point2i>& sampling,
-	const cv::Mat_<cv::Point3f>& labelCC,
+	const jp::img_coord_t& camPtsMap,
     const std::vector<std::vector<cv::Point2i>>& points,
     const std::vector<double>& losses,
     const std::vector<double>& sfScores,
@@ -1130,7 +1130,7 @@ std::vector<cv::Mat_<double>> dSMScore(
 
     // calculate gradients of the score function
     std::vector<cv::Mat_<double>> jacobeans;
-    dScore(estObj, sampling, labelCC, points, stateObj, jacobeans, scoreOutputGradients);
+    dScore(estObj, sampling, camPtsMap, points, stateObj, jacobeans, scoreOutputGradients);
 
     // data conversion
     for(unsigned i = 0; i < jacobeans.size(); i++)
@@ -1177,7 +1177,7 @@ std::vector<double> refine(
     const std::vector<std::vector<int>>& pixelIdxs,
     const jp::img_coord_t& estObj,
 	const jp::img_coord_t& camPts,
-	const cv::Mat_<cv::Point3f>& camPtsMap,
+	const jp::img_coord_t& camPtsMap,
     const cv::Mat_<cv::Point2i>& sampling,
     const cv::Mat& camMat,
     const std::vector<cv::Point3f>& imgdPts,
@@ -1203,7 +1203,7 @@ std::vector<double> refine(
             // inlier check
             if(diffMap(y, x) < inlierThreshold2D)
             {
-                localImgdPts.push_back(camPtsMap(y, x));
+                localImgdPts.push_back(cv::Point3f(camPtsMap(y, x)));
                 localObjPts.push_back(cv::Point3f(estObj(y, x)));
             }
 
@@ -1260,7 +1260,7 @@ cv::Mat_<double> dRefine(
     const std::vector<std::vector<int>>& pixelIdxs,
     const jp::img_coord_t& estObj,
 	const jp::img_coord_t& camPts,
-	const cv::Mat_<cv::Point3f>& camPtsMap,
+	const jp::img_coord_t& camPtsMap,
     const cv::Mat_<cv::Point2i>& sampling,
     const cv::Mat& camMat,
     const std::vector<cv::Point3f>& imgdPts,
@@ -1449,7 +1449,7 @@ void processImage(
     std::vector<double>& sfScores,
     jp::img_coord_t& estObj,
 	jp::img_coord_t& camPts,
-	cv::Mat_<cv::Point3f>& camPtsMap,
+	jp::img_coord_t& camPtsMap,
     cv::Mat_<cv::Point2i>& sampling,
     std::vector<std::vector<cv::Point2i>>& sampledPoints,
     std::vector<double>& losses,
@@ -1506,14 +1506,14 @@ void processImage(
 
             alreadyChosen(y, x) = 1;
 
-            imgdPts[h].push_back(camPtsMap(y, x)); // 2D location in the original RGB image
+            imgdPts[h].push_back(cv::Point3f(camPtsMap(y, x))); // 2D location in the original RGB image
             objPts[h].push_back(cv::Point3f(estObj(y, x))); // 3D object coordinate
             imgIdx[h].push_back(y * CNN_OBJ_PATCHSIZE + x); // pixel index in the subsampled image (for easier access in some data containers)
             sampledPoints[h].push_back(cv::Point2i(x, y)); // 2D pixel location in the subsampled image
         }
 
         // solve Kabsch
-        kabsch(imgdPts[h], objPts[h], refHyps[h]);
+        kabsch(imgdPts[h], objPts[h], hyps[h]);
 
         // project 3D points back into the image
         cv::projectPoints(objPts[h], hyps[h].first, hyps[h].second, camMat, cv::Mat(), projections);
@@ -1595,7 +1595,7 @@ void processImage(
                 // inlier check
                 if(localDiffMap(y, x) < inlierThreshold2D)
                 {
-                    localImgdPts.push_back(camPtsMap(y, x));
+                    localImgdPts.push_back(cv::Point3f(camPtsMap(y, x)));
                     localObjPts.push_back(cv::Point3f(estObj(y, x)));
                     inlierMaps[h](y, x) = inlierMaps[h](y, x) + 1;
                  }
