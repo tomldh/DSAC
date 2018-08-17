@@ -414,8 +414,8 @@ void kabsch(const std::vector<cv::Point3f>& imgdPts, const std::vector<cv::Point
 	t = cp - cx * R.t();  //equiv: cp - (R*cx.t()).t();
 
 	// store results
-	extCam.first = r.reshape(1, 3);
-	extCam.second = t.reshape(1, 3);
+	extCam.first = cv::Mat_<double>(r.reshape(1, 3));
+	extCam.second = cv::Mat_<double>(t.reshape(1, 3));
 
 	// end here no gradient is required
 	if (!calc)
@@ -1069,6 +1069,9 @@ void dScore(
         jp::cv_trans_t cvHyp;
         kabsch(imgdPts[h], objPts[h], cvHyp, dHdO); // 6x12
 
+        if (dHdO.empty())
+        	dKabschFD(imgdPts[h], objPts[h], dHdO);
+
         for(unsigned x = 0; x < dDiffMaps[h].cols; x++)
         for(unsigned y = 0; y < dDiffMaps[h].rows; y++)
         {
@@ -1205,6 +1208,8 @@ std::vector<double> refine(
             // inlier check
             if(diffMap(y, x) < inlierThreshold2D)
             {
+            	if (!jp::onObj(camPtsMap(y, x))) continue;
+
                 localImgdPts.push_back(cv::Point3f(camPtsMap(y, x)));
                 localObjPts.push_back(cv::Point3f(estObj(y, x)));
             }
@@ -1607,6 +1612,8 @@ void processImage(
                 // inlier check
                 if(localDiffMap(y, x) < inlierThreshold2D)
                 {
+                	if (!jp::onObj(camPtsMap(y, x))) continue;
+
                     localImgdPts.push_back(cv::Point3f(camPtsMap(y, x)));
                     localObjPts.push_back(cv::Point3f(estObj(y, x)));
                     inlierMaps[h](y, x) = inlierMaps[h](y, x) + 1;

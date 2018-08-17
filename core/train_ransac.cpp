@@ -377,7 +377,7 @@ int main(int argc, const char* argv[])
         std::cout << BLUETEXT("Calculating gradients wrt scores.") << std::endl;
 
         // calculate derivative of score (sampling prob.) wrt object coordinates, invoces backward pass on score CNN
-        std::vector<cv::Mat_<double>> dLoss_dScore_dObjs = dSMScore(estObj, camPtsMap, sampling, sampledPoints, losses, sfScores, stateObj);
+        std::vector<cv::Mat_<double>> dLoss_dScore_dObjs = dSMScore(estObj, sampling, camPtsMap, sampledPoints, losses, sfScores, stateObj);
 
         // accumulate gradients wrt object coordinate via the hypothesis score (sampling probability)
         cv::Mat_<double> dLoss_dScore_dObj = cv::Mat_<double>::zeros(patches.size(), 3);
