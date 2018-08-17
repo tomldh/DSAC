@@ -1035,6 +1035,8 @@ void dScore(
             int x = points[h][i].x;
             int y = points[h][i].y;
 
+            if (!jp::onObj(camPtsMap(y, x))) continue;
+
             imgdPts[h].push_back(cv::Point3f(camPtsMap(y, x)));
             objPts[h].push_back(cv::Point3f(estObj(y, x)));
         }
@@ -1469,6 +1471,7 @@ void processImage(
     estObj = getCoordImg(imgBGR, sampling, CNN_RGB_PATCHSIZE, patches, stateRGB);
 
 	camPtsMap = getCamPtsMap(camPts, sampling);
+	std::vector<std::vector<cv::Point2f>> localImgPts;
 
     std::cout << BLUETEXT("Sampling " << objHyps << " hypotheses.") << std::endl;
 
@@ -1476,6 +1479,7 @@ void processImage(
     imgdPts.resize(objHyps);
     objPts.resize(objHyps);
     sampledPoints.resize(objHyps);
+    localImgPts.resize(objHyps);
 
     // keep track of the points each hypothesis is samples from
     // the index references the patch list above
@@ -1491,6 +1495,7 @@ void processImage(
         objPts[h].clear();
         imgIdx[h].clear();
         sampledPoints[h].clear();
+        localImgPts[h].clear();
 
         for(int j = 0; j < ptCount; j++)
         {
@@ -1506,10 +1511,17 @@ void processImage(
 
             alreadyChosen(y, x) = 1;
 
+            if (!jp::onObj(camPtsMap(y, x)))
+            {
+            	j--;
+            	continue;
+            }
+
             imgdPts[h].push_back(cv::Point3f(camPtsMap(y, x))); // 2D location in the original RGB image
             objPts[h].push_back(cv::Point3f(estObj(y, x))); // 3D object coordinate
             imgIdx[h].push_back(y * CNN_OBJ_PATCHSIZE + x); // pixel index in the subsampled image (for easier access in some data containers)
             sampledPoints[h].push_back(cv::Point2i(x, y)); // 2D pixel location in the subsampled image
+            localImgPts[h].push_back(sampling(y, x));
         }
 
         // solve Kabsch
@@ -1520,9 +1532,9 @@ void processImage(
 
         // check reconstruction, 4 sampled points should be reconstructed perfectly
         bool foundOutlier = false;
-        for(unsigned j = 0; j < imgdPts[h].size(); j++)
+        for(unsigned j = 0; j < localImgPts[h].size(); j++)
         {
-            if(cv::norm(cv::Point2f(imgdPts[h][j].x, imgdPts[h][j].y) - projections[j]) < inlierThreshold2D) continue;
+            if(cv::norm(localImgPts[h][j] - projections[j]) < inlierThreshold2D) continue;
             foundOutlier = true;
             break;
         }

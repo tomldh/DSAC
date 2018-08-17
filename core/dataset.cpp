@@ -49,8 +49,8 @@ namespace jp
         GlobalProperties* gp = GlobalProperties::getInstance();
 
         eye(0) = (short) ((x - (gp->dP.imageWidth / 2.f + gp->dP.xShift)) / (gp->dP.focalLength / depth));
-        eye(1) = (short) -((y - (gp->dP.imageHeight / 2.f + gp->dP.yShift)) / (gp->dP.focalLength / depth));
-        eye(2) = (short) -depth;
+        eye(1) = (short) ((y - (gp->dP.imageHeight / 2.f + gp->dP.yShift)) / (gp->dP.focalLength / depth));
+        eye(2) = (short) depth;
 
         return eye;
     }
