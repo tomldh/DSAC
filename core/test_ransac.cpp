@@ -47,7 +47,7 @@ int main(int argc, const char* argv[])
 
     int objHyps = gp->pP.ransacIterations;;
 
-    int ptCount = 4;
+    int ptCount = 3;
     int inlierThreshold2D = gp->pP.ransacInlierThreshold2D;
     int refInlierCount = gp->pP.ransacBatchSize;
     int refSteps = gp->pP.ransacRefinementIterations;

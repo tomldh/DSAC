@@ -49,6 +49,27 @@ namespace jp
         GlobalProperties* gp = GlobalProperties::getInstance();
 
         eye(0) = (short) ((x - (gp->dP.imageWidth / 2.f + gp->dP.xShift)) / (gp->dP.focalLength / depth));
+        eye(1) = (short) -((y - (gp->dP.imageHeight / 2.f + gp->dP.yShift)) / (gp->dP.focalLength / depth));
+        eye(2) = (short) -depth;
+
+        return eye;
+    }
+
+    jp::coord3_t pxToEyeCV(int x, int y, jp::depth_t depth)
+    {
+        jp::coord3_t eye;
+
+        if(depth == 0 || depth > 6000)
+        {
+            eye(0) = 0;
+            eye(1) = 0;
+            eye(2) = 0;
+            return eye;
+        }
+
+        GlobalProperties* gp = GlobalProperties::getInstance();
+
+        eye(0) = (short) ((x - (gp->dP.imageWidth / 2.f + gp->dP.xShift)) / (gp->dP.focalLength / depth));
         eye(1) = (short) ((y - (gp->dP.imageHeight / 2.f + gp->dP.yShift)) / (gp->dP.focalLength / depth));
         eye(2) = (short) depth;
 

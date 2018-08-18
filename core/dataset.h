@@ -269,14 +269,14 @@ namespace jp
                 for(unsigned x = 0; x < img.cols; x++)
                 for(unsigned y = 0; y < img.rows; y++)
                 {
-                    if(depthData(y, x) == 0)
+                    if(depthData(y, x) == 0 || depthData(y, x) > 6000)
                     {
                         img(y, x) = jp::coord3_t(0, 0, 0);
                         continue;
                     }
 
                     // transform depth to camera coordinate
-                    img(y, x) = pxToEye(x, y, depthData(y, x));
+                    img(y, x) = pxToEyeCV(x, y, depthData(y, x));
                 }
     	}
 
