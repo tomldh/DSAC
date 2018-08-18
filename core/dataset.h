@@ -47,6 +47,7 @@ namespace jp
      * @return jp::coord3_t Camera coordinate.
      */
     jp::coord3_t pxToEye(int x, int y, jp::depth_t depth);
+    jp::coord3_t pxToEyeCV(int x, int y, jp::depth_t depth);
 
     /**
      * @brief Checks whether the given object coordinate lies on the object (is not 0 0 0).
