@@ -192,7 +192,7 @@ namespace jp
                 for(unsigned y = 0; y < img.rows; y++)
                 {
                     jp::depth_t depth = img(y, x);
-                    if(depth == 0 || depth > 6000) continue;
+                    if(depth == 0 || depth == 65535) continue;
 
                     cv::Point2f pt = mapDepthToRGB(x, y, depth);
                     depthMapped(pt.y, pt.x) = depth;
@@ -240,7 +240,7 @@ namespace jp
             for(unsigned x = 0; x < img.cols; x++)
             for(unsigned y = 0; y < img.rows; y++)
             {
-                if(depthData(y, x) == 0 || depthData(y, x) > 6000)
+                if(depthData(y, x) == 0)
                 {
                     img(y, x) = jp::coord3_t(0, 0, 0);
                     continue;
@@ -270,7 +270,7 @@ namespace jp
                 for(unsigned x = 0; x < img.cols; x++)
                 for(unsigned y = 0; y < img.rows; y++)
                 {
-                    if(depthData(y, x) == 0 || depthData(y, x) > 6000)
+                    if(depthData(y, x) == 0)
                     {
                         img(y, x) = jp::coord3_t(0, 0, 0);
                         continue;

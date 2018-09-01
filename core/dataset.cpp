@@ -38,7 +38,7 @@ namespace jp
     {
         jp::coord3_t eye;
 
-        if(depth == 0 || depth > 6000)
+        if(depth == 0)
         {
             eye(0) = 0;
             eye(1) = 0;
@@ -59,7 +59,7 @@ namespace jp
     {
         jp::coord3_t eye;
 
-        if(depth == 0 || depth > 6000)
+        if(depth == 0)
         {
             eye(0) = 0;
             eye(1) = 0;
